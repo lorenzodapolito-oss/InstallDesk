@@ -1,24 +1,44 @@
 @echo off
-chcp 65001 >nul
-setlocal
-rem Compila InstallDesk con il Rust portatile e crea dist\InstallDesk-portable.
-set "PROG=%~dp0"
-if exist "D:\AmbienteRust\cargo\bin\cargo.exe" (
-    set "CARGO_HOME=D:\AmbienteRust\cargo"
-    set "RUSTUP_HOME=D:\AmbienteRust\rustup"
-    set "PATH=D:\AmbienteRust\cargo\bin;%PATH%"
-)
-where cargo >nul 2>&1 || (echo Cargo non trovato. Controlla D:\AmbienteRust & pause & exit /b 1)
-if not exist "%PROG%InstallDesk\Cargo.toml" (
-    git clone https://github.com/lorenzodapolito-oss/InstallDesk "%PROG%InstallDesk" || (pause & exit /b 1)
+rem Scarica (o aggiorna) e compila InstallDesk. Metti questo file in AmbienteRust.
+title Costruisci InstallDesk
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+set "CARGO_HOME=%ROOT%\rust\cargo"
+set "RUSTUP_HOME=%ROOT%\rust\rustup"
+set "PATH=%ROOT%\winlibs\mingw64\bin;%ROOT%\rust\cargo\bin;%ROOT%\git\cmd;%ROOT%\git\bin;%PATH%"
+set "PROG=%ROOT%\Progetti"
+if not exist "%PROG%" mkdir "%PROG%"
+cd /d "%PROG%"
+taskkill /f /im installdesk.exe >nul 2>&1
+
+echo === Scarico o aggiorno InstallDesk ===
+if exist "%PROG%\InstallDesk\.git" (
+  git -C "%PROG%\InstallDesk" fetch origin
+  if errorlevel 1 goto fail
+  git -C "%PROG%\InstallDesk" reset --hard origin/main
 ) else (
-    git -C "%PROG%InstallDesk" pull
+  git clone https://github.com/lorenzodapolito-oss/InstallDesk "%PROG%\InstallDesk"
 )
-cd /d "%PROG%InstallDesk"
-cargo build --release || (echo Compilazione fallita & pause & exit /b 1)
-if exist dist rmdir /s /q dist
-mkdir "dist\InstallDesk-portable"
-copy /y "target\release\installdesk.exe" "dist\InstallDesk-portable\" >nul
+if errorlevel 1 goto fail
+
+echo === Compilo ===
+cd /d "%PROG%\InstallDesk"
+cargo build --release
+if errorlevel 1 goto fail
+
+set "OUT=%PROG%\InstallDesk\dist\InstallDesk-portable"
+if exist "%OUT%" rmdir /s /q "%OUT%"
+mkdir "%OUT%"
+copy /y "target\release\installdesk.exe" "%OUT%\InstallDesk.exe" >nul
+if errorlevel 1 goto fail
+
 echo.
-echo Pronto: %CD%\dist\InstallDesk-portable\installdesk.exe
+echo FATTO: %OUT%\InstallDesk.exe
 pause
+exit /b 0
+
+:fail
+echo.
+echo ERRORE: operazione non riuscita. Controlla i messaggi sopra.
+pause
+exit /b 1
