@@ -2,6 +2,7 @@
 
 use crate::catalog::CATALOG;
 use crate::config::{self, AppConfig};
+use crate::ext_panel::ExtPanel;
 use crate::manager::{self, Status};
 use crate::scan::{self, Item};
 use crate::theme;
@@ -38,6 +39,7 @@ enum PcState {
 enum Tab {
     Pc,
     Folder,
+    Ext,
 }
 
 struct PcRow {
@@ -70,6 +72,7 @@ pub struct App {
     cancel: Arc<AtomicBool>,
     confirm_install: bool,
     bulk: bool,
+    ext: ExtPanel,
 }
 
 impl App {
@@ -79,6 +82,7 @@ impl App {
         let cfg_path = app_dir.join(config::CONFIG_FILE);
         let cfg = config::load(&cfg_path);
         let (tx, rx) = channel();
+        let app_dir_copy = app_dir.clone();
         let mut app = Self {
             cfg,
             cfg_path,
@@ -97,6 +101,7 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             confirm_install: false,
             bulk: false,
+            ext: ExtPanel::new(&app_dir_copy),
         };
         app.refresh();
         let dir = app.root().display().to_string();
@@ -571,6 +576,13 @@ impl App {
         }
     }
 
+    /// Sposta nel registro i messaggi della scheda estensioni.
+    fn drain_ext(&mut self) {
+        for (c, m) in std::mem::take(&mut self.ext.msgs) {
+            self.say(c, m);
+        }
+    }
+
     fn status_text(st: &Option<Status>) -> RichText {
         match st {
             None => RichText::new("—").color(theme::MUTED),
@@ -690,6 +702,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump();
+        self.drain_ext();
         let ctx = ui.ctx().clone();
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(6.0);
@@ -745,6 +758,7 @@ impl eframe::App for App {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Pc, "Programmi del PC");
                 ui.selectable_value(&mut self.tab, Tab::Folder, "Installer scaricati");
+                ui.selectable_value(&mut self.tab, Tab::Ext, "Estensioni Chrome");
                 ui.separator();
                 let idle = !self.busy;
                 if ui
@@ -797,6 +811,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Pc => self.pc_table(ui),
             Tab::Folder => self.table(ui),
+            Tab::Ext => self.ext.ui(ui),
         });
         if self.confirm_install {
             let n = self.rows.iter().filter(|r| r.selected).count();

@@ -18,3 +18,9 @@ Richiede winget (incluso in Windows 10/11). Compilazione: `costruisci-installdes
 3. **Installa**: installa in silenzio gli installer selezionati nella scheda «Installer scaricati» (dopo conferma; Windows chiede l'autorizzazione di amministratore una sola volta).
 
 I programmi non presenti nell'archivio winget non si possono scaricare in automatico: copiali a mano nella cartella.
+
+## Scheda «Estensioni Chrome»
+
+- **Estrai da Chrome**: legge le estensioni di tutti i profili (nome, versione, profilo). Quelle non del Web Store e i temi non sono selezionati di default.
+- **Salva elenco**: crea `Estensioni.extdesk.json` più una pagina `.html` con i collegamenti al Web Store.
+- **Carica elenco…** + **Installa estensioni** (sul nuovo PC): due modi. *Web Store*: apre le pagine a gruppi di 8 e tu premi «Aggiungi a Chrome» (Chrome non permette l'installazione nascosta). *Installazione forzata*: criteri di Chrome via registro (amministratore); le estensioni risultano «gestite dall'organizzazione» finché non importi `Rimuovi-installazione-forzata.reg`. I file stanno nella cartella `Estensioni` accanto al programma.

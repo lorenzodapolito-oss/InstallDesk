@@ -3,8 +3,11 @@
 
 mod app;
 mod catalog;
+mod chrome;
 mod config;
 mod detect;
+mod ext_panel;
+mod extensions;
 mod manager;
 mod scan;
 mod scripts;
