@@ -52,6 +52,52 @@ fn installers_in(dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// True se `<radice>\\<programma>\\` contiene già un installer di versione uguale o più recente di
+/// `target` (versione ricavata dal nome file): in quel caso non serve scaricare di nuovo.
+pub fn is_current(root: &Path, program: &str, target: &str) -> bool {
+    let folder = root.join(scripts::safe_name(program));
+    installers_in(&folder).iter().any(|p| {
+        p.file_name()
+            .and_then(|n| version::from_filename(&n.to_string_lossy()))
+            .is_some_and(|have| have == target || version::is_newer(&have, target))
+    })
+}
+
+/// Gli installer che stanno nelle cartelle dei programmi indicati (nome del programma di
+/// winget): la cartella di ognuno è `safe_name(nome)`.
+pub fn items_for_names(items: &[Item], names: &[String]) -> Vec<Item> {
+    let prefixes: Vec<String> = names
+        .iter()
+        .map(|n| format!("{}\\", scripts::safe_name(n)).to_lowercase())
+        .collect();
+    items
+        .iter()
+        .filter(|i| {
+            let rel = i.rel_path.to_lowercase();
+            prefixes.iter().any(|p| rel.starts_with(p))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Scrive lo script che installa in sequenza `items` (con una sola richiesta di
+/// amministratore) e ne restituisce il percorso.
+pub fn write_run_script(root: &Path, items: &[Item]) -> Result<PathBuf, String> {
+    let jobs: Vec<scripts::Job<'_>> = items
+        .iter()
+        .map(|i| scripts::Job {
+            display: &i.program,
+            rel_path: &i.rel_path,
+            kind: i.kind,
+            args: &i.args,
+        })
+        .collect();
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let path = root.join("Installa-selezionati.cmd");
+    scripts::write(&path, &scripts::install_all(&jobs))?;
+    Ok(path)
+}
+
 /// Scarica la nuova versione in `<radice>\<Programma>\`.
 /// Il download passa da una cartella temporanea: se il file non sembra un installer
 /// viene scartato. Le versioni precedenti vengono spostate in `Vecchie\`, mai cancellate.
@@ -221,6 +267,9 @@ mod tests {
         std::fs::write(root.join("Git").join("Git-2.40.0.exe"), b"MZ old").unwrap();
         struct Html;
         impl Winget for Html {
+            fn list_installed(&self) -> Result<Vec<crate::winget::Installed>, String> {
+                Ok(Vec::new())
+            }
             fn latest_version(&self, _: &str) -> Result<String, String> {
                 Ok("9".into())
             }
@@ -242,6 +291,37 @@ mod tests {
         assert!(download_update(&w, &root, "Git", "Git.Git")
             .unwrap_err()
             .contains("rete"));
+    }
+
+    #[test]
+    fn is_current_compares_versions_in_file_names() {
+        let root = dir("cur");
+        std::fs::create_dir_all(root.join("Git")).unwrap();
+        std::fs::write(root.join("Git").join("Git-2.47.1-64-bit.exe"), b"MZ").unwrap();
+        assert!(is_current(&root, "Git", "2.47.1"));
+        assert!(is_current(&root, "Git", "2.40.0"));
+        assert!(!is_current(&root, "Git", "2.50.0"));
+        assert!(!is_current(&root, "Altro", "1.0"));
+    }
+
+    #[test]
+    fn items_are_matched_by_program_folder_and_run_script_is_written() {
+        let root = dir("run");
+        for (f, n) in [
+            ("Git", "Git-2.47.1.exe"),
+            ("VLC media player", "vlc-3.0.21.exe"),
+        ] {
+            std::fs::create_dir_all(root.join(f)).unwrap();
+            std::fs::write(root.join(f).join(n), b"MZ").unwrap();
+        }
+        let items = scan::scan(&root, &AppConfig::default());
+        assert_eq!(items.len(), 2);
+        let sel = items_for_names(&items, &["VLC media player".into()]);
+        assert_eq!(sel.len(), 1);
+        assert!(items_for_names(&items, &[]).is_empty());
+        let p = write_run_script(&root, &sel).unwrap();
+        let text = std::fs::read_to_string(p).unwrap();
+        assert!(text.contains("vlc-3.0.21.exe") && !text.contains("Git-2.47.1"));
     }
 
     #[test]

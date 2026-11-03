@@ -5,11 +5,13 @@ use crate::config::{self, AppConfig};
 use crate::manager::{self, Status};
 use crate::scan::{self, Item};
 use crate::theme;
-use crate::winget::RealWinget;
+use crate::winget::{Installed, RealWinget};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 
 pub const APP_TITLE: &str = "InstallDesk";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -18,7 +20,30 @@ enum Event {
     Log(Color32, String),
     Checked(String, Status),
     Downloaded(String, Result<PathBuf, String>),
+    Scanned(Result<Vec<Installed>, String>),
+    PcState(String, PcState),
     Done,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PcState {
+    Waiting,
+    Downloading,
+    Downloaded,
+    AlreadyHave,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Pc,
+    Folder,
+}
+
+struct PcRow {
+    inst: Installed,
+    selected: bool,
+    state: Option<PcState>,
 }
 
 struct Row {
@@ -39,6 +64,12 @@ pub struct App {
     catalog_open: bool,
     catalog_filter: String,
     catalog_sel: BTreeSet<usize>,
+    tab: Tab,
+    pc: Vec<PcRow>,
+    pc_filter: String,
+    cancel: Arc<AtomicBool>,
+    confirm_install: bool,
+    bulk: bool,
 }
 
 impl App {
@@ -60,6 +91,12 @@ impl App {
             catalog_open: false,
             catalog_filter: String::new(),
             catalog_sel: BTreeSet::new(),
+            tab: Tab::Pc,
+            pc: Vec::new(),
+            pc_filter: String::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            confirm_install: false,
+            bulk: false,
         };
         app.refresh();
         let dir = app.root().display().to_string();
@@ -236,6 +273,234 @@ impl App {
         }
     }
 
+    /// Passo 1: elenca i programmi installati nel PC che winget sa scaricare.
+    fn start_scan(&mut self) {
+        self.busy = true;
+        self.say(
+            theme::LOG_INFO,
+            "Scansione dei programmi installati nel PC...".into(),
+        );
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::Scanned(crate::winget::Winget::list_installed(
+                &RealWinget,
+            )));
+            let _ = tx.send(Event::Done);
+        });
+    }
+
+    /// Passo 2: scarica i programmi del PC selezionati (salta quelli già presenti aggiornati).
+    fn download_pc(&mut self) {
+        let jobs: Vec<Installed> = self
+            .pc
+            .iter()
+            .filter(|r| r.selected)
+            .map(|r| r.inst.clone())
+            .collect();
+        if jobs.is_empty() {
+            self.say(
+                theme::LOG_WARN,
+                "Prima scansiona il PC e seleziona qualcosa.".into(),
+            );
+            return;
+        }
+        self.busy = true;
+        self.bulk = true;
+        self.cancel.store(false, Ordering::SeqCst);
+        for r in self.pc.iter_mut().filter(|r| r.selected) {
+            r.state = Some(PcState::Waiting);
+        }
+        let (root, tx, cancel) = (self.root(), self.tx.clone(), self.cancel.clone());
+        self.say(
+            theme::LOG_INFO,
+            format!("Scarico {} programmi in {}", jobs.len(), root.display()),
+        );
+        std::thread::spawn(move || {
+            let w = RealWinget;
+            for inst in jobs {
+                if cancel.load(Ordering::SeqCst) {
+                    let _ = tx.send(Event::Log(theme::LOG_WARN, "Download interrotto.".into()));
+                    break;
+                }
+                let target = inst
+                    .available
+                    .clone()
+                    .unwrap_or_else(|| inst.version.clone());
+                if manager::is_current(&root, &inst.name, &target) {
+                    let _ = tx.send(Event::PcState(inst.id.clone(), PcState::AlreadyHave));
+                    continue;
+                }
+                let _ = tx.send(Event::PcState(inst.id.clone(), PcState::Downloading));
+                let st = match manager::download_update(&w, &root, &inst.name, &inst.id) {
+                    Ok(_) => PcState::Downloaded,
+                    Err(e) => PcState::Failed(e),
+                };
+                let _ = tx.send(Event::PcState(inst.id.clone(), st));
+            }
+            let _ = tx.send(Event::Done);
+        });
+    }
+
+    /// Passo 3: scrive ed esegue lo script che installa in silenzio i programmi selezionati.
+    fn install_selected(&mut self) {
+        let items: Vec<Item> = self
+            .rows
+            .iter()
+            .filter(|r| r.selected)
+            .map(|r| r.item.clone())
+            .collect();
+        if items.is_empty() {
+            self.say(theme::LOG_WARN, "Nessun installer selezionato.".into());
+            return;
+        }
+        let root = self.root();
+        match manager::write_run_script(&root, &items) {
+            Err(e) => self.say(theme::LOG_ERR, format!("Errore: {e}")),
+            Ok(path) => {
+                #[cfg(windows)]
+                {
+                    let r = std::process::Command::new("cmd")
+                        .arg("/c")
+                        .arg("start")
+                        .arg("")
+                        .arg(&path)
+                        .spawn();
+                    match r {
+                        Ok(_) => self.say(theme::LOG_OK, format!("Installazione di {} programmi avviata (conferma l'avviso di amministratore).", items.len())),
+                        Err(e) => self.say(theme::LOG_ERR, format!("{}: {e}", path.display())),
+                    }
+                }
+                #[cfg(not(windows))]
+                self.say(
+                    theme::LOG_WARN,
+                    format!(
+                        "Script creato: {} (l'installazione è solo per Windows).",
+                        path.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    fn big_button(ui: &mut egui::Ui, text: &str, color: Color32, enabled: bool) -> bool {
+        let b = egui::Button::new(
+            RichText::new(text)
+                .size(17.0)
+                .strong()
+                .color(theme::ON_COLOR),
+        )
+        .fill(color)
+        .min_size(egui::vec2(190.0, 40.0));
+        ui.add_enabled(enabled, b).clicked()
+    }
+
+    fn pc_table(&mut self, ui: &mut egui::Ui) {
+        if self.pc.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Nessuna scansione ancora").size(18.0).strong());
+                ui.label(RichText::new("Premi «1 Scansiona il PC»: InstallDesk elenca tutti i programmi installati\nche winget sa scaricare. Poi «2 Scarica» li salva nella cartella predefinita.").color(theme::MUTED));
+            });
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Filtra:");
+            ui.text_edit_singleline(&mut self.pc_filter);
+            if ui.button("Seleziona tutti").clicked() {
+                self.pc.iter_mut().for_each(|r| r.selected = true);
+            }
+            if ui.button("Nessuno").clicked() {
+                self.pc.iter_mut().for_each(|r| r.selected = false);
+            }
+            if ui.button("Solo con aggiornamento").clicked() {
+                self.pc
+                    .iter_mut()
+                    .for_each(|r| r.selected = r.inst.available.is_some());
+            }
+            let n = self.pc.iter().filter(|r| r.selected).count();
+            ui.label(
+                RichText::new(format!("{n} di {} selezionati", self.pc.len())).color(theme::MUTED),
+            );
+        });
+        let f = self.pc_filter.to_lowercase();
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("pcrows")
+                    .striped(true)
+                    .num_columns(5)
+                    .spacing([14.0, 8.0])
+                    .show(ui, |ui| {
+                        for h in ["", "Programma", "Installata", "Disponibile", "Stato"] {
+                            ui.label(RichText::new(h).strong().color(theme::MUTED));
+                        }
+                        ui.end_row();
+                        for r in self
+                            .pc
+                            .iter_mut()
+                            .filter(|r| f.is_empty() || r.inst.name.to_lowercase().contains(&f))
+                        {
+                            ui.checkbox(&mut r.selected, "");
+                            ui.label(RichText::new(&r.inst.name).strong());
+                            ui.label(&r.inst.version);
+                            match &r.inst.available {
+                                Some(a) => ui.label(RichText::new(a).color(theme::WARN).strong()),
+                                None => ui.label(RichText::new("—").color(theme::MUTED)),
+                            };
+                            let (txt, col) = match &r.state {
+                                None => ("", theme::MUTED),
+                                Some(PcState::Waiting) => ("In coda", theme::MUTED),
+                                Some(PcState::Downloading) => ("Scarico...", theme::SCAN),
+                                Some(PcState::Downloaded) => ("Scaricato", theme::OK),
+                                Some(PcState::AlreadyHave) => ("Già presente", theme::OK),
+                                Some(PcState::Failed(_)) => ("Errore", theme::ERR),
+                            };
+                            let resp = ui.label(RichText::new(txt).color(col));
+                            if let Some(PcState::Failed(e)) = &r.state {
+                                resp.on_hover_text(e);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    /// Dopo il download di massa: aggiorna l'elenco e crea gli script silenziosi.
+    fn finish_bulk(&mut self) {
+        self.refresh();
+        let names: Vec<String> = self
+            .pc
+            .iter()
+            .filter(|r| matches!(r.state, Some(PcState::Downloaded | PcState::AlreadyHave)))
+            .map(|r| r.inst.name.clone())
+            .collect();
+        let items: Vec<Item> = manager::items_for_names(
+            &self.rows.iter().map(|r| r.item.clone()).collect::<Vec<_>>(),
+            &names,
+        );
+        let failed = self
+            .pc
+            .iter()
+            .filter(|r| matches!(r.state, Some(PcState::Failed(_))))
+            .count();
+        if !items.is_empty() {
+            let root = self.root();
+            match manager::write_scripts(&root, &items) {
+                Ok(n) => self.say(
+                    theme::LOG_OK,
+                    format!("Pronti {n} script di installazione silenziosa."),
+                ),
+                Err(e) => self.say(theme::LOG_ERR, format!("Script non creati: {e}")),
+            }
+        }
+        if failed > 0 {
+            self.say(
+                theme::LOG_WARN,
+                format!("{failed} programmi non scaricati (vedi sopra)."),
+            );
+        }
+    }
+
     fn pump(&mut self) {
         let mut refresh = false;
         while let Ok(ev) = self.rx.try_recv() {
@@ -264,8 +529,38 @@ impl App {
                     }
                     Err(e) => self.say(theme::LOG_ERR, format!("{program}: {e}")),
                 },
+                Event::Scanned(res) => match res {
+                    Ok(list) => {
+                        self.say(
+                            theme::LOG_OK,
+                            format!("Trovati {} programmi scaricabili.", list.len()),
+                        );
+                        self.pc = list
+                            .into_iter()
+                            .map(|inst| PcRow {
+                                inst,
+                                selected: true,
+                                state: None,
+                            })
+                            .collect();
+                        self.pc.sort_by_key(|r| r.inst.name.to_lowercase());
+                    }
+                    Err(e) => self.say(theme::LOG_ERR, format!("Scansione non riuscita: {e}")),
+                },
+                Event::PcState(id, st) => {
+                    if let PcState::Failed(e) = &st {
+                        let msg = format!("{id}: {e}");
+                        self.say(theme::LOG_ERR, msg);
+                    }
+                    if let Some(r) = self.pc.iter_mut().find(|r| r.inst.id == id) {
+                        r.state = Some(st);
+                    }
+                }
                 Event::Done => {
                     self.busy = false;
+                    if std::mem::take(&mut self.bulk) {
+                        self.finish_bulk();
+                    }
                     refresh = true;
                     self.say(theme::LOG_INFO, "Operazione terminata.".into());
                 }
@@ -417,14 +712,41 @@ impl eframe::App for App {
                     self.open_folder();
                 }
             });
-            ui.horizontal_wrapped(|ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
                 let idle = !self.busy;
-                if ui
-                    .add_enabled(idle, egui::Button::new("Aggiorna elenco"))
-                    .clicked()
-                {
-                    self.refresh();
+                if Self::big_button(ui, "1  Scansiona il PC", theme::SCAN, idle) {
+                    self.tab = Tab::Pc;
+                    self.start_scan();
                 }
+                if Self::big_button(
+                    ui,
+                    "2  Scarica",
+                    theme::DOWNLOAD,
+                    idle && !self.pc.is_empty(),
+                ) {
+                    self.download_pc();
+                }
+                if Self::big_button(
+                    ui,
+                    "3  Installa",
+                    theme::INSTALL,
+                    idle && !self.rows.is_empty(),
+                ) {
+                    self.confirm_install = true;
+                }
+                if self.busy {
+                    ui.spinner();
+                    if ui.button("Interrompi").clicked() {
+                        self.cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Pc, "Programmi del PC");
+                ui.selectable_value(&mut self.tab, Tab::Folder, "Installer scaricati");
+                ui.separator();
+                let idle = !self.busy;
                 if ui
                     .add_enabled(idle, egui::Button::new("Controlla aggiornamenti"))
                     .clicked()
@@ -446,8 +768,11 @@ impl eframe::App for App {
                 {
                     self.make_scripts();
                 }
-                if self.busy {
-                    ui.spinner();
+                if ui
+                    .add_enabled(idle, egui::Button::new("Aggiorna elenco"))
+                    .clicked()
+                {
+                    self.refresh();
                 }
             });
             ui.add_space(4.0);
@@ -469,7 +794,29 @@ impl eframe::App for App {
                         });
                 });
         });
-        egui::CentralPanel::default().show(ui, |ui| self.table(ui));
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
+            Tab::Pc => self.pc_table(ui),
+            Tab::Folder => self.table(ui),
+        });
+        if self.confirm_install {
+            let n = self.rows.iter().filter(|r| r.selected).count();
+            egui::Window::new("Installare i programmi?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(format!("Verranno installati in silenzio {n} programmi dalla cartella degli installer (scheda «Installer scaricati»). Windows chiederà l'autorizzazione di amministratore."));
+                    ui.horizontal(|ui| {
+                        if Self::big_button(ui, "Installa", theme::INSTALL, n > 0) {
+                            self.confirm_install = false;
+                            self.install_selected();
+                        }
+                        if ui.button("Annulla").clicked() {
+                            self.confirm_install = false;
+                        }
+                    });
+                });
+        }
         if self.catalog_open {
             self.catalog_window(&ctx);
         }
