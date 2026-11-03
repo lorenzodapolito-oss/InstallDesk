@@ -5,6 +5,7 @@ use crate::config::{self, AppConfig};
 use crate::ext_panel::ExtPanel;
 use crate::manager::{self, Status};
 use crate::scan::{self, Item};
+use crate::setup_panel::SetupPanel;
 use crate::theme;
 use crate::winget::{Installed, RealWinget};
 use eframe::egui::{self, Color32, RichText};
@@ -40,6 +41,7 @@ enum Tab {
     Pc,
     Folder,
     Ext,
+    Setup,
 }
 
 struct PcRow {
@@ -73,6 +75,7 @@ pub struct App {
     confirm_install: bool,
     bulk: bool,
     ext: ExtPanel,
+    setup: SetupPanel,
 }
 
 impl App {
@@ -102,6 +105,7 @@ impl App {
             confirm_install: false,
             bulk: false,
             ext: ExtPanel::new(&app_dir_copy),
+            setup: SetupPanel::new(&app_dir_copy),
         };
         app.refresh();
         let dir = app.root().display().to_string();
@@ -578,7 +582,10 @@ impl App {
 
     /// Sposta nel registro i messaggi della scheda estensioni.
     fn drain_ext(&mut self) {
-        for (c, m) in std::mem::take(&mut self.ext.msgs) {
+        let msgs = std::mem::take(&mut self.ext.msgs)
+            .into_iter()
+            .chain(std::mem::take(&mut self.setup.msgs));
+        for (c, m) in msgs.collect::<Vec<_>>() {
             self.say(c, m);
         }
     }
@@ -759,6 +766,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Pc, "Programmi del PC");
                 ui.selectable_value(&mut self.tab, Tab::Folder, "Installer scaricati");
                 ui.selectable_value(&mut self.tab, Tab::Ext, "Estensioni Chrome");
+                ui.selectable_value(&mut self.tab, Tab::Setup, "Configurazione Windows");
                 ui.separator();
                 let idle = !self.busy;
                 if ui
@@ -812,6 +820,7 @@ impl eframe::App for App {
             Tab::Pc => self.pc_table(ui),
             Tab::Folder => self.table(ui),
             Tab::Ext => self.ext.ui(ui),
+            Tab::Setup => self.setup.ui(ui),
         });
         if self.confirm_install {
             let n = self.rows.iter().filter(|r| r.selected).count();

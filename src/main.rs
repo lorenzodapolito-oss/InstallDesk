@@ -11,6 +11,8 @@ mod extensions;
 mod manager;
 mod scan;
 mod scripts;
+mod setup;
+mod setup_panel;
 mod theme;
 mod version;
 mod winget;
