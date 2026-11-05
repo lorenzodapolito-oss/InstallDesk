@@ -13,9 +13,9 @@ taskkill /f /im installdesk.exe >nul 2>&1
 
 echo === Scarico o aggiorno InstallDesk ===
 if exist "%PROG%\InstallDesk\.git" (
-  git -C "%PROG%\InstallDesk" fetch origin
+  git -c "safe.directory=*" -C "%PROG%\InstallDesk" fetch origin
   if errorlevel 1 goto fail
-  git -C "%PROG%\InstallDesk" reset --hard origin/main
+  git -c "safe.directory=*" -C "%PROG%\InstallDesk" reset --hard origin/main
 ) else (
   git clone https://github.com/lorenzodapolito-oss/InstallDesk "%PROG%\InstallDesk"
 )
